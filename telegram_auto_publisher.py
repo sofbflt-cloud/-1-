@@ -23,7 +23,7 @@ Environment variables (set before running):
   TIMEZONE        – optional, default "UTC"
   DB_PATH         – optional, default "bot_state.sqlite3
 """
-
+from __future__ import annotations
 import sys
 import subprocess
 import pkg_resources
