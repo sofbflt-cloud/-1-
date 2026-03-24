@@ -1,973 +1,707 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Telegram Auto-Publisher Bot – Professional Edition
-
-Features:
-- Private admin‑only control panel with inline buttons
-- Auto‑publishing to a private channel (English quotes, Arabic poetry)
-- Islamic reminders on a separate schedule
-- AI generation via OpenAI (optional; falls back to safe templates if unavailable)
-- Alternating mode: English ↔ Arabic, or fixed mode
-- Custom intervals for posts and reminders
-- SQLite persistence, async aiogram 3.x, long polling
-- Unicode styling for English texts, diacritized Arabic wrapping
-
-Environment variables (set before running):
-  BOT_TOKEN       – Telegram bot token
-  ADMIN_ID        – your numeric Telegram user ID
-  CHANNEL_ID      – channel username (e.g. @my_channel) or numeric ID (with -100 prefix)
-  OPENAI_API_KEY  – optional, OpenAI API key
-  AI_MODEL        – optional, default "gpt-4o-mini"
-  TIMEZONE        – optional, default "UTC"
-  DB_PATH         – optional, default "bot_state.sqlite3
-"""
-from __future__ import annotations
 import sys
 import subprocess
-import pkg_resources
-
-# قائمة المكتبات المطلوبة
-required = {
-    "aiogram",
-    "openai",
-    "aiohttp",
-    "python-dotenv"
-}
-
-# جلب المكتبات المثبتة
-installed = {pkg.key for pkg in pkg_resources.working_set}
-
-# تحديد الناقص
-missing = required - installed
-
-if missing:
-    print(f"📦 جاري تثبيت المكتبات الناقصة: {missing}")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
-else:
-    print("✅ كل المكتبات مثبتة مسبقًا")
-
-# بعد التثبيت نقدر نستورد عادي
-
-from __future__ import annotations
-
-import asyncio
-import html
+import importlib
 import logging
+import asyncio
+import json
 import os
 import random
-import re
-import sqlite3
-import sys
 import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Optional
+from typing import Optional, Dict, Any, List, Tuple, Union
+from dataclasses import dataclass, asdict, field
+from contextlib import suppress
+import signal
+import traceback
 
-from aiogram import Bot, Dispatcher, Router
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ChatAction, ParseMode
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
+# =========================
+#  AUTO INSTALL DEPENDENCIES
+# =========================
+required_packages = [
+    "aiogram",
+    "openai",
+    "python-dotenv"
+]
+
+for package in required_packages:
+    try:
+        importlib.import_module(package)
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+
+# Now import after ensuring installation
+import aiohttp
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
+import openai
+
+# =========================
+#  CONFIGURATION (EDIT THESE)
+# =========================
+BOT_TOKEN = "8749230463:AAEu1zuSSkJ8qA287uIvqOQkpRvWrI0bW2s"           # Replace with your bot token
+ADMIN_ID = 6891530912                        # Replace with your Telegram user ID
+CHANNEL_ID = -1003729799230                 # Replace with your channel ID (negative for private supergroup/channel)
+
+DEFAULT_POST_INTERVAL_MINUTES = 60
+DEFAULT_REMINDER_INTERVAL_MINUTES = 30
+DEFAULT_POST_MODE = "alternating"           # "arabic_only", "english_only", "alternating"
+DEFAULT_LANGUAGE_ROTATION_MODE = "alternating"
+DEFAULT_REMINDERS_ENABLED = True
+
+OPENAI_API_KEY = "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"  # Required for AI generation
+
+# =========================
+#  CONSTANTS & TEMPLATES
+# =========================
+SETTINGS_FILE = "bot_settings.json"
+LOG_FILE = "bot.log"
+
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler()
+    ]
 )
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+logger = logging.getLogger(__name__)
 
-try:
-    from openai import AsyncOpenAI
-except ImportError:
-    AsyncOpenAI = None
+# Fallback templates for AI failures
+FALLBACK_ENGLISH_QUOTES = [
+    "The only way to do great work is to love what you do.",
+    "Life is what happens when you're busy making other plans.",
+    "The future belongs to those who believe in the beauty of their dreams.",
+    "It does not matter how slowly you go as long as you do not stop.",
+    "Your time is limited, don't waste it living someone else's life."
+]
 
+FALLBACK_ARABIC_POETRY = [
+    "﴿ أَلاَ بِذِكْرِ اللَّهِ تَطْمَئِنُّ الْقُلُوبُ ﴾",
+    "﴿ وَإِنْ يَمْسَسْكَ اللَّهُ بِضُرٍّ فَلَا كَاشِفَ لَهُ إِلَّا هُوَ ﴾",
+    "﴿ فَإِنَّ مَعَ الْعُسْرِ يُسْرًا ﴾",
+    "﴿ رَبَّنَا آتِنَا فِي الدُّنْيَا حَسَنَةً وَفِي الْآخِرَةِ حَسَنَةً ﴾",
+    "﴿ وَاصْبِرْ فَإِنَّ اللَّهَ لَا يُضِيعُ أَجْرَ الْمُحْسِنِينَ ﴾"
+]
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-@dataclass(slots=True)
-class Config:
-    bot_token: str
-    admin_id: int
-    channel_id: str
-    openai_api_key: str = ""
-    ai_model: str = "gpt-4o-mini"
-    timezone_name: str = "UTC"
-    db_path: str = "bot_state.sqlite3"
+ISLAMIC_REMINDERS = [
+    "سبحان الله وبحمده، سبحان الله العظيم",
+    "اللهم صلِّ على محمد وعلى آل محمد كما صليت على إبراهيم وعلى آل إبراهيم إنك حميد مجيد",
+    "أستغفر الله العظيم الذي لا إله إلا هو الحي القيوم وأتوب إليه",
+    "لا إله إلا الله وحده لا شريك له، له الملك وله الحمد وهو على كل شيء قدير",
+    "حسبي الله لا إله إلا هو عليه توكلت وهو رب العرش العظيم",
+    "اللهم إني أسألك العفو والعافية في الدنيا والآخرة",
+    "اللهم أعني على ذكرك وشكرك وحسن عبادتك",
+    "اللهم إني ظلمت نفسي ظلماً كثيراً ولا يغفر الذنوب إلا أنت فاغفر لي مغفرة من عندك وارحمني إنك أنت الغفور الرحيم"
+]
+
+# =========================
+#  PERSISTENCE SETTINGS
+# =========================
+@dataclass
+class BotSettings:
+    posting_enabled: bool = True
+    reminders_enabled: bool = DEFAULT_REMINDERS_ENABLED
+    post_mode: str = DEFAULT_POST_MODE  # "arabic_only", "english_only", "alternating"
+    post_interval_minutes: int = DEFAULT_POST_INTERVAL_MINUTES
+    reminder_interval_minutes: int = DEFAULT_REMINDER_INTERVAL_MINUTES
+    last_language: str = "english"  # for alternating mode
+    last_post_content: Optional[str] = None
+    last_generated_content: Optional[str] = None
+    formatting_style_english: int = 0  # 0=bold, 1=italic, 2=code, etc.
+    formatting_style_arabic: int = 0   # 0=decorative, 1=plain
+    rotation_mode: str = "alternating"  # same as post_mode but kept for clarity
+    version: int = 1
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
     @classmethod
-    def from_env(cls) -> Config:
-        token = os.getenv("BOT_TOKEN", "").strip()
-        if not token:
-            raise RuntimeError("BOT_TOKEN is missing")
+    def from_dict(cls, data: dict) -> "BotSettings":
+        return cls(**data)
 
-        admin_raw = os.getenv("ADMIN_ID", "").strip()
-        if not admin_raw.isdigit():
-            raise RuntimeError("ADMIN_ID must be a numeric Telegram user ID")
+class SettingsManager:
+    _lock = asyncio.Lock()
 
-        channel = os.getenv("CHANNEL_ID", "").strip()
-        if not channel:
-            raise RuntimeError("CHANNEL_ID is missing")
+    def __init__(self, filepath: str):
+        self.filepath = filepath
+        self.settings = self.load()
 
-        return cls(
-            bot_token=token,
-            admin_id=int(admin_raw),
-            channel_id=channel,
-            openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
-            ai_model=os.getenv("AI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini",
-            timezone_name=os.getenv("TIMEZONE", "UTC").strip() or "UTC",
-            db_path=os.getenv("DB_PATH", "bot_state.sqlite3").strip() or "bot_state.sqlite3",
-        )
-
-
-# ---------------------------------------------------------------------------
-# Database (SQLite)
-# ---------------------------------------------------------------------------
-class DB:
-    def __init__(self, path: str):
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self._init_schema()
-
-    def _init_schema(self) -> None:
-        cur = self.conn.cursor()
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kind TEXT NOT NULL,
-                language TEXT,
-                content TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            )
-            """
-        )
-        self.conn.commit()
-
-        defaults = {
-            "posting_enabled": "1",
-            "reminders_enabled": "1",
-            "post_mode": "alternate",  # english | arabic | alternate
-            "post_interval_min": "60",
-            "reminder_interval_min": "30",
-            "alternate_next": "english",
-            "next_post_at": "0",
-            "next_reminder_at": "0",
-            "preview_enabled": "1",
-            "generated_count": "0",
-        }
-        for k, v in defaults.items():
-            self.set_if_missing(k, v)
-
-    def set_if_missing(self, key: str, value: str) -> None:
-        cur = self.conn.cursor()
-        cur.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (key, value))
-        self.conn.commit()
-
-    def get(self, key: str, default: str = "") -> str:
-        cur = self.conn.cursor()
-        cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
-        row = cur.fetchone()
-        return row["value"] if row else default
-
-    def set(self, key: str, value: str) -> None:
-        cur = self.conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO settings(key, value) VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-            """,
-            (key, str(value)),
-        )
-        self.conn.commit()
-
-    def update_many(self, items: dict[str, Any]) -> None:
-        cur = self.conn.cursor()
-        cur.executemany(
-            """
-            INSERT INTO settings(key, value) VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-            """,
-            [(k, str(v)) for k, v in items.items()],
-        )
-        self.conn.commit()
-
-    def as_dict(self) -> dict[str, str]:
-        cur = self.conn.cursor()
-        cur.execute("SELECT key, value FROM settings")
-        return {row["key"]: row["value"] for row in cur.fetchall()}
-
-    def add_history(self, kind: str, content: str, language: str = "") -> None:
-        cur = self.conn.cursor()
-        cur.execute(
-            "INSERT INTO history(kind, language, content, created_at) VALUES (?, ?, ?, ?)",
-            (kind, language, content, int(time.time())),
-        )
-        self.conn.commit()
-
-    def last_history(self) -> Optional[sqlite3.Row]:
-        cur = self.conn.cursor()
-        cur.execute("SELECT * FROM history ORDER BY id DESC LIMIT 1")
-        return cur.fetchone()
-
-    def increment_generated(self) -> None:
-        val = int(self.get("generated_count", "0")) + 1
-        self.set("generated_count", str(val))
-
-    def close(self) -> None:
-        self.conn.close()
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-FALLBACK_QUOTES = [
-    "The quietest minds often build the loudest futures.",
-    "A single honest choice can outgrow a thousand excuses.",
-    "What you repeat becomes your destiny.",
-    "Discipline is the art of proving yourself right in silence.",
-    "Clarity is a form of courage.",
-]
-
-FALLBACK_ARABIC = [
-    "﴿وَقَلْبٌ يُجَاهِدُ لِيَبْقَى النُّورُ فِيهِ﴾",
-    "﴿إِذَا صَفَا الْقَلْبُ أَبْصَرَ مَا لَا يُبْصِرُهُ الضَّوْءُ﴾",
-    "﴿وَفِي الصَّبْرِ مِفْتَاحُ أَبْوَابٍ تُغَلَّقُ دُونَ الْعَجَلَةِ﴾",
-]
-
-REMINDER_TEXTS = [
-    "﴿سُبْحَانَ اللَّهِ وَبِحَمْدِهِ﴾",
-    "﴿أَسْتَغْفِرُ اللَّهَ الْعَظِيمَ وَأَتُوبُ إِلَيْهِ﴾",
-    "﴿اللَّهُمَّ صَلِّ عَلَى مُحَمَّدٍ وَآلِ مُحَمَّدٍ﴾",
-    "﴿رَبَّنَا آتِنَا فِي الدُّنْيَا حَسَنَةً وَفِي الْآخِرَةِ حَسَنَةً﴾",
-    "﴿لَا إِلَهَ إِلَّا اللَّهُ وَحْدَهُ لَا شَرِيكَ لَهُ﴾",
-    "﴿اللَّهُمَّ اجْعَلْ فِي قَلْبِي نُورًا﴾",
-]
-
-# Unicode style mappings for English
-ENGLISH_STYLES = {
-    "bold": str.maketrans({
-        **{c: chr(ord("𝐀") + (ord(c) - ord("A"))) for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
-        **{c: chr(ord("𝐚") + (ord(c) - ord("a"))) for c in "abcdefghijklmnopqrstuvwxyz"},
-        **{c: chr(ord("𝟎") + (ord(c) - ord("0"))) for c in "0123456789"},
-    }),
-    "italic": str.maketrans({
-        **{c: chr(ord("𝐴") + (ord(c) - ord("A"))) for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
-        **{c: chr(ord("𝑎") + (ord(c) - ord("a"))) for c in "abcdefghijklmnopqrstuvwxyz"},
-    }),
-    "mono": str.maketrans({
-        **{c: chr(ord("𝙰") + (ord(c) - ord("A"))) for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
-        **{c: chr(ord("𝚊") + (ord(c) - ord("a"))) for c in "abcdefghijklmnopqrstuvwxyz"},
-        **{c: chr(ord("𝟶") + (ord(c) - ord("0"))) for c in "0123456789"},
-    }),
-    "sans": str.maketrans({
-        **{c: chr(ord("𝗔") + (ord(c) - ord("A"))) for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
-        **{c: chr(ord("𝗮") + (ord(c) - ord("a"))) for c in "abcdefghijklmnopqrstuvwxyz"},
-        **{c: chr(ord("𝟬") + (ord(c) - ord("0"))) for c in "0123456789"},
-    }),
-}
-
-
-def now_ts() -> int:
-    return int(time.time())
-
-
-def safe_html(text: str) -> str:
-    return html.escape(text, quote=False)
-
-
-def human_delta(seconds: int) -> str:
-    seconds = max(0, int(seconds))
-    minutes, sec = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    days, hours = divmod(hours, 24)
-    parts = []
-    if days:
-        parts.append(f"{days}d")
-    if hours:
-        parts.append(f"{hours}h")
-    if minutes:
-        parts.append(f"{minutes}m")
-    if not parts:
-        parts.append(f"{sec}s")
-    return " ".join(parts)
-
-
-def apply_random_english_style(text: str) -> str:
-    style = random.choice(list(ENGLISH_STYLES.values()))
-    return text.translate(style)
-
-
-def clean_text(text: str) -> str:
-    text = text.strip()
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    text = re.sub(r"[\u200f\u200e]", "", text)
-    return text
-
-
-def format_english(text: str) -> str:
-    text = clean_text(text)
-    text = text.strip().strip("\"“”'")
-    styled = apply_random_english_style(text)
-    return f"✨ <b>{safe_html(styled)}</b> ✨"
-
-
-def format_arabic(text: str) -> str:
-    text = clean_text(text)
-    text = text.strip("﴿﴾[](){}<>「」『』\"' ")
-    # Wrap in decorative brackets
-    return f"﴿\n{safe_html(text)}\n﴾"
-
-
-def format_reminder(text: str) -> str:
-    return f"🕊️ <b>{safe_html(text)}</b>"
-
-
-def validate_positive_minutes(value: int, minimum: int = 1, maximum: int = 24 * 60) -> int:
-    return max(minimum, min(maximum, int(value)))
-
-
-# ---------------------------------------------------------------------------
-# AI Engine
-# ---------------------------------------------------------------------------
-class AIEngine:
-    def __init__(self, api_key: str, model: str):
-        self.available = bool(api_key and AsyncOpenAI is not None)
-        self.model = model
-        self.client = AsyncOpenAI(api_key=api_key) if self.available else None
-
-    async def _chat_completion(self, system: str, user: str) -> str:
-        if not self.available or self.client is None:
-            raise RuntimeError("AI not configured")
-        resp = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.8,
-            max_tokens=150,
-        )
-        text = resp.choices[0].message.content or ""
-        return clean_text(text)
-
-    async def english_quote(self) -> str:
-        system = (
-            "You write short, deep, elegant English quotes for a private Telegram channel. "
-            "Return only the quote text. No bullets, no labels, no hashtags, no mention of AI. "
-            "Keep it concise, emotionally resonant, refined, maximum 18 words."
-        )
-        user = "Generate one original English quote."
+    def load(self) -> BotSettings:
         try:
-            text = await self._chat_completion(system, user)
-            if not text:
-                raise RuntimeError("empty")
-            return text
-        except Exception:
-            return random.choice(FALLBACK_QUOTES)
+            if os.path.exists(self.filepath):
+                with open(self.filepath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    return BotSettings.from_dict(data)
+        except Exception as e:
+            logger.error(f"Failed to load settings: {e}")
+        return BotSettings()
 
-    async def arabic_poem(self) -> str:
-        system = (
-            "أنت شاعر عربي فصيح تكتب بيتًا أو سطرًا شعريًا واحدًا بأسلوب تراثي بلاغي. "
-            "أعد النص فقط، بدون شرح، بدون عنوان، بدون ذكر أنه مولّد. "
-            "اجعل اللغة فصيحة، قوية، جميلة الإيقاع، ومشكولة بالكامل."
-        )
-        user = "اكتب نصًا شعريًا عربيًا فصيحًا قصيرًا جدًا (بيت واحد أو نصف بيت) مشكولًا بالكامل."
+    async def save(self) -> bool:
+        async with self._lock:
+            try:
+                with open(self.filepath, "w", encoding="utf-8") as f:
+                    json.dump(self.settings.to_dict(), f, ensure_ascii=False, indent=2)
+                return True
+            except Exception as e:
+                logger.error(f"Failed to save settings: {e}")
+                return False
+
+    async def update(self, **kwargs) -> bool:
+        for key, value in kwargs.items():
+            if hasattr(self.settings, key):
+                setattr(self.settings, key, value)
+        return await self.save()
+
+    def get(self) -> BotSettings:
+        return self.settings
+
+    async def reload(self) -> None:
+        self.settings = self.load()
+
+# =========================
+#  AI GENERATION (OpenAI)
+# =========================
+class AIGenerator:
+    def __init__(self, api_key: str):
+        openai.api_key = api_key
+        self.client = openai.AsyncOpenAI(api_key=api_key)
+
+    async def generate_english_quote(self, style: int = None) -> str:
+        styles = [
+            "profound and inspiring",
+            "minimalist and deep",
+            "philosophical and thought-provoking",
+            "poetic and lyrical"
+        ]
+        chosen_style = styles[style % len(styles)] if style is not None else random.choice(styles)
+        prompt = f"Generate a short, profound English quote (max 15 words) in the style of {chosen_style}. Do not use clichés. Make it original and impactful."
+
         try:
-            text = await self._chat_completion(system, user)
-            if not text:
-                raise RuntimeError("empty")
-            return text
-        except Exception:
-            return random.choice(FALLBACK_ARABIC)
+            response = await self.client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=50,
+                temperature=0.8
+            )
+            quote = response.choices[0].message.content.strip()
+            if not quote:
+                raise ValueError("Empty response")
+            return quote
+        except Exception as e:
+            logger.error(f"AI English generation failed: {e}")
+            return random.choice(FALLBACK_ENGLISH_QUOTES)
 
-    async def reminder(self) -> str:
-        # Static reminders for reliability
-        return random.choice(REMINDER_TEXTS)
+    async def generate_arabic_poetry(self, style: int = None) -> str:
+        styles = [
+            "classical Arabic poetry with full diacritics (tashkeel)",
+            "ancient style of Imru' al-Qais",
+            "wisdom poetry like Al-Mutanabbi",
+            "mystical Sufi poetry with rich imagery"
+        ]
+        chosen_style = styles[style % len(styles)] if style is not None else random.choice(styles)
+        prompt = f"اكتب بيتاً واحداً من الشعر العربي الفصيح (شطرين) بالكامل مع التشكيل، بأسلوب {chosen_style}. تأكد من صحة اللغة وجودة السبك. اخرج النص فقط دون تعليقات."
 
+        try:
+            response = await self.client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=100,
+                temperature=0.9
+            )
+            poetry = response.choices[0].message.content.strip()
+            if not poetry:
+                raise ValueError("Empty response")
+            # Ensure it has diacritics? Not mandatory but we trust AI.
+            return poetry
+        except Exception as e:
+            logger.error(f"AI Arabic generation failed: {e}")
+            return random.choice(FALLBACK_ARABIC_POETRY)
 
-# ---------------------------------------------------------------------------
-# Keyboards & Callbacks
-# ---------------------------------------------------------------------------
-class MenuCB:
-    prefix = "menu"
+# =========================
+#  TEXT FORMATTERS
+# =========================
+class TextFormatter:
+    @staticmethod
+    def format_english(text: str, style: int = 0) -> str:
+        # Style 0: Bold, 1: Italic, 2: Code, 3: Underline
+        if style == 0:
+            return f"<b>{text}</b>"
+        elif style == 1:
+            return f"<i>{text}</i>"
+        elif style == 2:
+            return f"<code>{text}</code>"
+        elif style == 3:
+            return f"<u>{text}</u>"
+        else:
+            return f"<b>{text}</b>"  # default bold
 
     @staticmethod
-    def pack(action: str) -> str:
-        return f"{MenuCB.prefix}:{action}"
+    def format_arabic(text: str, style: int = 0) -> str:
+        # Style 0: Decorative with ﴿ ﴾, Style 1: Plain
+        if style == 0:
+            return f"﴿ {text} ﴾"
+        else:
+            return text
 
-
-class InputStates(StatesGroup):
-    waiting_post_interval = State()
-    waiting_reminder_interval = State()
-
-
-def panel_keyboard() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-
-    builder.row(
-        InlineKeyboardButton(text="▶ تشغيل النشر", callback_data=MenuCB.pack("start_posts")),
-        InlineKeyboardButton(text="⏸ إيقاف النشر", callback_data=MenuCB.pack("stop_posts")),
-    )
-    builder.row(
-        InlineKeyboardButton(text="🧭 عربي فقط", callback_data=MenuCB.pack("mode_ar")),
-        InlineKeyboardButton(text="🌐 إنجليزي فقط", callback_data=MenuCB.pack("mode_en")),
-        InlineKeyboardButton(text="🔁 تناوب", callback_data=MenuCB.pack("mode_alt")),
-    )
-    builder.row(
-        InlineKeyboardButton(text="⏱ مدة النشر", callback_data=MenuCB.pack("set_post_interval")),
-        InlineKeyboardButton(text="🕋 مدة التذكير", callback_data=MenuCB.pack("set_reminder_interval")),
-    )
-    builder.row(
-        InlineKeyboardButton(text="📿 تشغيل/إيقاف التذكير", callback_data=MenuCB.pack("toggle_reminders")),
-        InlineKeyboardButton(text="📝 توليد الآن", callback_data=MenuCB.pack("post_now")),
-    )
-    builder.row(
-        InlineKeyboardButton(text="👁 معاينة", callback_data=MenuCB.pack("preview")),
-        InlineKeyboardButton(text="💾 حفظ", callback_data=MenuCB.pack("save")),
-    )
-    builder.row(
-        InlineKeyboardButton(text="📊 الحالة", callback_data=MenuCB.pack("status")),
-        InlineKeyboardButton(text="🕘 آخر منشور", callback_data=MenuCB.pack("last_post")),
-    )
-    builder.row(
-        InlineKeyboardButton(text="⚙ الإعدادات", callback_data=MenuCB.pack("settings")),
-        InlineKeyboardButton(text="♻ إعادة ضبط", callback_data=MenuCB.pack("reset")),
-        InlineKeyboardButton(text="🔄 تحديث اللوحة", callback_data=MenuCB.pack("refresh")),
-    )
-    return builder.as_markup()
-
-
-def mode_keyboard() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="عربي فقط", callback_data=MenuCB.pack("mode_ar")),
-        InlineKeyboardButton(text="إنجليزي فقط", callback_data=MenuCB.pack("mode_en")),
-        InlineKeyboardButton(text="تناوب", callback_data=MenuCB.pack("mode_alt")),
-    )
-    builder.row(InlineKeyboardButton(text="⬅ رجوع", callback_data=MenuCB.pack("refresh")))
-    return builder.as_markup()
-
-
-def durations_keyboard(kind: str) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    presets = [5, 10, 15, 30, 60, 120]
-    for minutes in presets:
-        builder.add(InlineKeyboardButton(text=f"{minutes} دقيقة", callback_data=MenuCB.pack(f"{kind}_{minutes}")))
-    builder.adjust(3, 3)
-    builder.row(
-        InlineKeyboardButton(text="مخصص", callback_data=MenuCB.pack(f"{kind}_custom")),
-        InlineKeyboardButton(text="⬅ رجوع", callback_data=MenuCB.pack("refresh")),
-    )
-    return builder.as_markup()
-
-
-# ---------------------------------------------------------------------------
-# Application State Helpers
-# ---------------------------------------------------------------------------
-def load_settings(db: DB) -> dict[str, Any]:
-    raw = db.as_dict()
-    return {
-        "posting_enabled": raw.get("posting_enabled", "1") == "1",
-        "reminders_enabled": raw.get("reminders_enabled", "1") == "1",
-        "post_mode": raw.get("post_mode", "alternate"),
-        "post_interval_min": int(raw.get("post_interval_min", "60")),
-        "reminder_interval_min": int(raw.get("reminder_interval_min", "30")),
-        "alternate_next": raw.get("alternate_next", "english"),
-        "next_post_at": int(raw.get("next_post_at", "0")),
-        "next_reminder_at": int(raw.get("next_reminder_at", "0")),
-        "preview_enabled": raw.get("preview_enabled", "1") == "1",
-        "generated_count": int(raw.get("generated_count", "0")),
-    }
-
-
-def save_settings(db: DB, **kwargs: Any) -> None:
-    db.update_many(kwargs)
-
-
-def sync_timers(db: DB) -> None:
-    s = load_settings(db)
-    now = now_ts()
-    if s["next_post_at"] <= 0:
-        save_settings(db, next_post_at=str(now + s["post_interval_min"] * 60))
-    if s["next_reminder_at"] <= 0:
-        save_settings(db, next_reminder_at=str(now + s["reminder_interval_min"] * 60))
-
-
-def panel_text(db: DB) -> str:
-    s = load_settings(db)
-    mode_label = {
-        "english": "إنجليزي فقط",
-        "arabic": "عربي فقط",
-        "alternate": "تناوب عربي/إنجليزي",
-    }.get(s["post_mode"], s["post_mode"])
-
-    next_post_in = s["next_post_at"] - now_ts()
-    next_rem_in = s["next_reminder_at"] - now_ts()
-
-    return (
-        "🤖 <b>لوحة التحكم الخاصة</b>\n\n"
-        f"• النشر: <b>{'مفعل' if s['posting_enabled'] else 'متوقف'}</b>\n"
-        f"• التذكيرات: <b>{'مفعلة' if s['reminders_enabled'] else 'متوقفة'}</b>\n"
-        f"• النمط: <b>{safe_html(mode_label)}</b>\n"
-        f"• مدة النشر: <b>{s['post_interval_min']} دقيقة</b>\n"
-        f"• مدة التذكير: <b>{s['reminder_interval_min']} دقيقة</b>\n"
-        f"• المنشور التالي خلال: <b>{human_delta(next_post_in)}</b>\n"
-        f"• التذكير التالي خلال: <b>{human_delta(next_rem_in)}</b>\n"
-        f"• عدد ما تم توليده: <b>{s['generated_count']}</b>\n"
-    )
-
-
-async def safe_send_or_edit(
-    target: Message | CallbackQuery,
-    text: str,
-    reply_markup: Optional[InlineKeyboardMarkup] = None,
-) -> None:
-    try:
-        if isinstance(target, Message):
-            await target.answer(text, reply_markup=reply_markup)
-        else:  # CallbackQuery
-            if target.message:
-                await target.message.edit_text(text, reply_markup=reply_markup)
-            await target.answer()
-    except TelegramBadRequest:
-        if isinstance(target, CallbackQuery):
-            await target.answer("تعذر تحديث اللوحة الآن", show_alert=True)
-
-
-# ---------------------------------------------------------------------------
-# Core Bot Logic
-# ---------------------------------------------------------------------------
-class AutoPublisher:
-    def __init__(self, bot: Bot, db: DB, ai: AIEngine):
+# =========================
+#  SCHEDULER TASKS
+# =========================
+class Scheduler:
+    def __init__(self, bot: Bot, settings_mgr: SettingsManager, ai_gen: AIGenerator):
         self.bot = bot
-        self.db = db
-        self.ai = ai
-        self.post_task: asyncio.Task | None = None
-        self.rem_task: asyncio.Task | None = None
+        self.settings_mgr = settings_mgr
+        self.ai_gen = ai_gen
+        self.posting_task: Optional[asyncio.Task] = None
+        self.reminder_task: Optional[asyncio.Task] = None
+        self._stop_event = asyncio.Event()
 
-    def settings(self) -> dict[str, Any]:
-        return load_settings(self.db)
+    async def start_posting_task(self):
+        if self.posting_task and not self.posting_task.done():
+            self.posting_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.posting_task
+        self.posting_task = asyncio.create_task(self._posting_loop())
 
-    def choose_language(self) -> str:
-        s = self.settings()
-        mode = s["post_mode"]
-        if mode == "english":
-            return "english"
-        if mode == "arabic":
-            return "arabic"
-        # alternate
-        next_lang = s["alternate_next"]
-        return "english" if next_lang not in {"english", "arabic"} else next_lang
+    async def stop_posting_task(self):
+        if self.posting_task and not self.posting_task.done():
+            self.posting_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.posting_task
+            self.posting_task = None
 
-    def advance_alternate(self, current: str) -> None:
-        next_lang = "arabic" if current == "english" else "english"
-        save_settings(self.db, alternate_next=next_lang)
+    async def start_reminder_task(self):
+        if self.reminder_task and not self.reminder_task.done():
+            self.reminder_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.reminder_task
+        self.reminder_task = asyncio.create_task(self._reminder_loop())
 
-    async def generate_post(self, preview: bool = False) -> tuple[str, str]:
-        lang = self.choose_language()
-        if lang == "english":
-            raw = await self.ai.english_quote()
-            final = format_english(raw)
-        else:
-            raw = await self.ai.arabic_poem()
-            final = format_arabic(raw)
+    async def stop_reminder_task(self):
+        if self.reminder_task and not self.reminder_task.done():
+            self.reminder_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.reminder_task
+            self.reminder_task = None
 
-        if not preview:
-            self.db.increment_generated()
-            self.db.add_history("post", final, lang)
-            if self.settings()["post_mode"] == "alternate":
-                self.advance_alternate(lang)
-        return lang, final
-
-    async def generate_reminder(self, preview: bool = False) -> str:
-        raw = await self.ai.reminder()
-        final = format_reminder(raw)
-        if not preview:
-            self.db.add_history("reminder", final, "ar")
-        return final
-
-    async def post_to_channel(self, text: str) -> None:
-        await self.bot.send_chat_action(CONFIG.channel_id, ChatAction.TYPING)
-        await self.bot.send_message(
-            chat_id=CONFIG.channel_id,
-            text=text,
-            disable_web_page_preview=True,
-        )
-
-    async def publish_now(self) -> str:
-        lang, text = await self.generate_post(preview=False)
-        await self.post_to_channel(text)
-        # Reschedule next post
-        interval = self.settings()["post_interval_min"]
-        save_settings(self.db, next_post_at=str(now_ts() + interval * 60))
-        return f"✅ تم النشر بنجاح ({lang})"
-
-    async def preview_post(self) -> tuple[str, str]:
-        return await self.generate_post(preview=True)
-
-    async def send_reminder_now(self) -> str:
-        text = await self.generate_reminder(preview=False)
-        await self.post_to_channel(text)
-        interval = self.settings()["reminder_interval_min"]
-        save_settings(self.db, next_reminder_at=str(now_ts() + interval * 60))
-        return "✅ تم إرسال التذكير"
-
-    async def post_loop(self) -> None:
+    async def _posting_loop(self):
         while True:
-            s = self.settings()
-            if not s["posting_enabled"]:
-                await asyncio.sleep(5)
-                continue
-
-            due = s["next_post_at"]
-            wait = max(1, due - now_ts()) if due else 0
-            if wait > 0:
-                await asyncio.sleep(min(wait, 30))
-                continue
-
             try:
-                await self.bot.send_chat_action(CONFIG.channel_id, ChatAction.TYPING)
-                lang, text = await self.generate_post(preview=False)
-                await self.bot.send_message(CONFIG.channel_id, text, disable_web_page_preview=True)
-                interval = s["post_interval_min"]
-                save_settings(self.db, next_post_at=str(now_ts() + interval * 60))
-                logging.info("Posted auto content (%s)", lang)
-            except Exception:
-                logging.exception("Failed to publish auto post")
-                # Reschedule anyway to avoid infinite loop
-                interval = s["post_interval_min"]
-                save_settings(self.db, next_post_at=str(now_ts() + interval * 60))
-                await asyncio.sleep(5)
+                settings = self.settings_mgr.get()
+                if not settings.posting_enabled:
+                    await asyncio.sleep(10)
+                    continue
 
-    async def reminder_loop(self) -> None:
+                # Determine next language based on mode
+                lang = None
+                if settings.post_mode == "arabic_only":
+                    lang = "arabic"
+                elif settings.post_mode == "english_only":
+                    lang = "english"
+                else:  # alternating
+                    lang = "arabic" if settings.last_language == "english" else "english"
+                    # update last_language after sending
+                # Generate content
+                if lang == "english":
+                    quote = await self.ai_gen.generate_english_quote(settings.formatting_style_english)
+                    formatted = TextFormatter.format_english(quote, settings.formatting_style_english)
+                else:
+                    poetry = await self.ai_gen.generate_arabic_poetry(settings.formatting_style_arabic)
+                    formatted = TextFormatter.format_arabic(poetry, settings.formatting_style_arabic)
+
+                # Send to channel
+                try:
+                    await self.bot.send_message(chat_id=CHANNEL_ID, text=formatted, parse_mode="HTML")
+                    logger.info(f"Posted {lang} content to channel")
+                    # Update last_language if alternating
+                    if settings.post_mode == "alternating":
+                        settings.last_language = lang
+                        await self.settings_mgr.update(last_language=lang)
+                    await self.settings_mgr.update(last_post_content=formatted)
+                except Exception as e:
+                    logger.error(f"Failed to send post: {e}")
+
+                # Wait for next interval
+                await asyncio.sleep(settings.post_interval_minutes * 60)
+            except asyncio.CancelledError:
+                logger.info("Posting loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Unexpected error in posting loop: {e}")
+                await asyncio.sleep(30)  # backoff
+
+    async def _reminder_loop(self):
         while True:
-            s = self.settings()
-            if not s["reminders_enabled"]:
-                await asyncio.sleep(5)
-                continue
-
-            due = s["next_reminder_at"]
-            wait = max(1, due - now_ts()) if due else 0
-            if wait > 0:
-                await asyncio.sleep(min(wait, 30))
-                continue
-
             try:
-                text = await self.generate_reminder(preview=False)
-                await self.bot.send_message(CONFIG.channel_id, text, disable_web_page_preview=True)
-                interval = s["reminder_interval_min"]
-                save_settings(self.db, next_reminder_at=str(now_ts() + interval * 60))
-                logging.info("Posted reminder")
-            except Exception:
-                logging.exception("Failed to publish reminder")
-                interval = s["reminder_interval_min"]
-                save_settings(self.db, next_reminder_at=str(now_ts() + interval * 60))
-                await asyncio.sleep(5)
+                settings = self.settings_mgr.get()
+                if not settings.reminders_enabled:
+                    await asyncio.sleep(10)
+                    continue
 
-    def start_background_tasks(self) -> None:
-        if self.post_task is None or self.post_task.done():
-            self.post_task = asyncio.create_task(self.post_loop(), name="post_loop")
-        if self.rem_task is None or self.rem_task.done():
-            self.rem_task = asyncio.create_task(self.reminder_loop(), name="reminder_loop")
+                # Pick random reminder
+                reminder = random.choice(ISLAMIC_REMINDERS)
+                try:
+                    await self.bot.send_message(chat_id=CHANNEL_ID, text=reminder, parse_mode="HTML")
+                    logger.info("Sent Islamic reminder")
+                except Exception as e:
+                    logger.error(f"Failed to send reminder: {e}")
 
-    async def stop_background_tasks(self) -> None:
-        for task in (self.post_task, self.rem_task):
-            if task and not task.done():
-                task.cancel()
-        await asyncio.gather(
-            *(t for t in (self.post_task, self.rem_task) if t),
-            return_exceptions=True,
-        )
+                await asyncio.sleep(settings.reminder_interval_minutes * 60)
+            except asyncio.CancelledError:
+                logger.info("Reminder loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Unexpected error in reminder loop: {e}")
+                await asyncio.sleep(30)
 
+    async def restart_all(self):
+        await self.stop_posting_task()
+        await self.stop_reminder_task()
+        await self.start_posting_task()
+        await self.start_reminder_task()
 
-# ---------------------------------------------------------------------------
-# Routers and Handlers
-# ---------------------------------------------------------------------------
-router = Router()
-CONFIG: Config
-DB_INSTANCE: DB
-APP_INSTANCE: AutoPublisher
+# =========================
+#  INLINE KEYBOARDS
+# =========================
+def main_menu(settings: BotSettings) -> InlineKeyboardMarkup:
+    kb = []
+    # Row 1: Toggle Posting
+    status_text = "✅ نشر نشط" if settings.posting_enabled else "⛔ نشر متوقف"
+    kb.append([InlineKeyboardButton(text=status_text, callback_data="toggle_posting")])
+    # Row 2: Post Mode
+    mode_text = f"نمط النشر: {settings.post_mode}"
+    kb.append([InlineKeyboardButton(text=mode_text, callback_data="change_mode")])
+    # Row 3: Change intervals
+    kb.append([
+        InlineKeyboardButton(text=f"⏱️ مدة النشر ({settings.post_interval_minutes} د)", callback_data="set_post_interval"),
+        InlineKeyboardButton(text=f"🕰️ مدة التذكير ({settings.reminder_interval_minutes} د)", callback_data="set_reminder_interval")
+    ])
+    # Row 4: Reminders toggle
+    reminder_text = "🔔 التذكيرات مفعلة" if settings.reminders_enabled else "🔕 التذكيرات معطلة"
+    kb.append([InlineKeyboardButton(text=reminder_text, callback_data="toggle_reminders")])
+    # Row 5: Manual actions
+    kb.append([
+        InlineKeyboardButton(text="📝 توليد منشور الآن", callback_data="generate_now"),
+        InlineKeyboardButton(text="👁️ معاينة", callback_data="preview")
+    ])
+    # Row 6: Additional
+    kb.append([
+        InlineKeyboardButton(text="📋 آخر منشور", callback_data="last_post"),
+        InlineKeyboardButton(text="⚙️ الإعدادات", callback_data="show_settings")
+    ])
+    # Row 7: System
+    kb.append([
+        InlineKeyboardButton(text="🔄 إعادة تعيين الإعدادات", callback_data="reset_settings"),
+        InlineKeyboardButton(text="📊 حالة النظام", callback_data="system_status")
+    ])
+    # Row 8: Formatting styles
+    kb.append([
+        InlineKeyboardButton(text="🎨 تنسيق إنجليزي", callback_data="change_english_style"),
+        InlineKeyboardButton(text="🎨 تنسيق عربي", callback_data="change_arabic_style")
+    ])
+    # Row 9: Emergency
+    kb.append([
+        InlineKeyboardButton(text="⏹️ إيقاف فوري", callback_data="emergency_stop"),
+        InlineKeyboardButton(text="▶️ تشغيل تلقائي", callback_data="auto_start")
+    ])
+    # Row 10: Reload settings
+    kb.append([InlineKeyboardButton(text="🔄 إعادة تحميل الإعدادات", callback_data="reload_settings")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
 
+def mode_selection_menu() -> InlineKeyboardMarkup:
+    kb = [
+        [InlineKeyboardButton(text="عربي فقط", callback_data="mode_arabic_only")],
+        [InlineKeyboardButton(text="إنجليزي فقط", callback_data="mode_english_only")],
+        [InlineKeyboardButton(text="تناوب", callback_data="mode_alternating")],
+        [InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_main")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
 
-def is_admin(user_id: int) -> bool:
-    return user_id == CONFIG.admin_id
+def interval_menu(interval_type: str) -> InlineKeyboardMarkup:
+    kb = []
+    for minutes in [15, 30, 60, 120, 240]:
+        kb.append([InlineKeyboardButton(text=f"{minutes} دقيقة", callback_data=f"{interval_type}_{minutes}")])
+    kb.append([InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_main")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
 
+def style_menu(style_type: str) -> InlineKeyboardMarkup:
+    kb = []
+    if style_type == "english":
+        options = ["غامق (Bold)", "مائل (Italic)", "كود (Code)", "مسطر (Underline)"]
+        for idx, opt in enumerate(options):
+            kb.append([InlineKeyboardButton(text=opt, callback_data=f"style_eng_{idx}")])
+    else:
+        options = ["زخرفي (﴿ ﴾)", "عادي"]
+        for idx, opt in enumerate(options):
+            kb.append([InlineKeyboardButton(text=opt, callback_data=f"style_arb_{idx}")])
+    kb.append([InlineKeyboardButton(text="🔙 رجوع", callback_data="back_to_main")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
 
-async def admin_only_reply(message: Message) -> None:
-    await message.answer("هذا البوت خاص بالإدارة فقط")
-
-
-@router.message(Command("start"))
-@router.message(Command("panel"))
-async def cmd_start_panel(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
-        await admin_only_reply(message)
-        return
-    await state.clear()
-    await message.answer(panel_text(DB_INSTANCE), reply_markup=panel_keyboard())
-
-
-@router.message(lambda m: m.from_user and not is_admin(m.from_user.id))
-async def any_other_message(message: Message) -> None:
-    await admin_only_reply(message)
-
-
-@router.callback_query(F.data.startswith(f"{MenuCB.prefix}:"))
-async def menu_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    if not callback.from_user or not is_admin(callback.from_user.id):
-        await callback.answer("هذا البوت خاص بالإدارة فقط", show_alert=True)
-        return
-
-    action = callback.data.split(":", 1)[1]
-    db = DB_INSTANCE
-    pub = APP_INSTANCE
-
-    async def update_panel(extra: str = "") -> None:
-        text = panel_text(db) + (f"\n{extra}" if extra else "")
-        await safe_send_or_edit(callback, text, panel_keyboard())
-
-    if action == "refresh":
-        await update_panel()
-        return
-
-    if action == "start_posts":
-        save_settings(db, posting_enabled="1", next_post_at=str(now_ts()))
-        await update_panel("✅ تم تشغيل النشر")
-        return
-
-    if action == "stop_posts":
-        save_settings(db, posting_enabled="0")
-        await update_panel("⏸ تم إيقاف النشر")
-        return
-
-    if action == "mode_ar":
-        save_settings(db, post_mode="arabic")
-        await update_panel("✅ النمط: عربي فقط")
-        return
-
-    if action == "mode_en":
-        save_settings(db, post_mode="english")
-        await update_panel("✅ النمط: إنجليزي فقط")
-        return
-
-    if action == "mode_alt":
-        save_settings(db, post_mode="alternate", alternate_next="english")
-        await update_panel("✅ النمط: تناوب")
-        return
-
-    if action == "set_post_interval":
-        await state.set_state(InputStates.waiting_post_interval)
-        await safe_send_or_edit(
-            callback,
-            "أرسل مدة النشر بالدقائق، أو اختر قيمة من الأزرار:",
-            durations_keyboard("post"),
-        )
-        return
-
-    if action.startswith("post_") and action != "post_now":
-        if action.endswith("custom"):
-            await state.set_state(InputStates.waiting_post_interval)
-            await safe_send_or_edit(callback, "أرسل مدة النشر بالدقائق كرقم فقط:")
+# =========================
+#  BOT HANDLERS
+# =========================
+def admin_only(func):
+    async def wrapper(message_or_callback, *args, **kwargs):
+        user_id = None
+        if isinstance(message_or_callback, Message):
+            user_id = message_or_callback.from_user.id
+        elif isinstance(message_or_callback, CallbackQuery):
+            user_id = message_or_callback.from_user.id
         else:
-            minutes = int(action.split("_", 1)[1])
-            minutes = validate_positive_minutes(minutes)
-            save_settings(db, post_interval_min=str(minutes), next_post_at=str(now_ts() + minutes * 60))
-            await update_panel(f"✅ تم ضبط مدة النشر إلى {minutes} دقيقة")
-        return
-
-    if action == "set_reminder_interval":
-        await state.set_state(InputStates.waiting_reminder_interval)
-        await safe_send_or_edit(
-            callback,
-            "أرسل مدة التذكير بالدقائق، أو اختر قيمة من الأزرار:",
-            durations_keyboard("rem"),
-        )
-        return
-
-    if action.startswith("rem_"):
-        if action.endswith("custom"):
-            await state.set_state(InputStates.waiting_reminder_interval)
-            await safe_send_or_edit(callback, "أرسل مدة التذكير بالدقائق كرقم فقط:")
-        else:
-            minutes = int(action.split("_", 1)[1])
-            minutes = validate_positive_minutes(minutes)
-            save_settings(db, reminder_interval_min=str(minutes), next_reminder_at=str(now_ts() + minutes * 60))
-            await update_panel(f"✅ تم ضبط مدة التذكير إلى {minutes} دقيقة")
-        return
-
-    if action == "toggle_reminders":
-        s = load_settings(db)
-        new_val = "0" if s["reminders_enabled"] else "1"
-        save_settings(db, reminders_enabled=new_val, next_reminder_at=str(now_ts() + s["reminder_interval_min"] * 60))
-        await update_panel(f"✅ التذكيرات: {'مفعلة' if new_val == '1' else 'متوقفة'}")
-        return
-
-    if action == "post_now":
-        await callback.answer("جارِ النشر...", show_alert=False)
-        try:
-            result = await pub.publish_now()
-            await update_panel(result)
-        except Exception as e:
-            logging.exception("Manual post failed")
-            await safe_send_or_edit(callback, f"❌ فشل النشر: {e}", panel_keyboard())
-        return
-
-    if action == "preview":
-        try:
-            lang, text = await pub.preview_post()
-            preview = f"👁 <b>معاينة ({safe_html(lang)})</b>\n\n{text}"
-            await callback.message.answer(preview)
-            await callback.answer("تمت المعاينة")
-        except Exception as e:
-            await callback.answer(f"فشل المعاينة: {e}", show_alert=True)
-        return
-
-    if action == "save":
-        await update_panel("💾 تم حفظ الإعدادات")
-        return
-
-    if action == "status":
-        await update_panel()
-        return
-
-    if action == "settings":
-        await safe_send_or_edit(
-            callback,
-            "⚙ <b>الإعدادات الحالية</b>\n\n" + panel_text(db),
-            mode_keyboard(),
-        )
-        return
-
-    if action == "last_post":
-        row = db.last_history()
-        if not row:
-            await callback.answer("لا يوجد منشور سابق", show_alert=True)
             return
-        created = datetime.fromtimestamp(row["created_at"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        content = row["content"]
-        await callback.message.answer(
-            f"🕘 <b>آخر عنصر في السجل</b>\n"
-            f"• النوع: <b>{safe_html(row['kind'])}</b>\n"
-            f"• اللغة: <b>{safe_html(row['language'] or '-')}</b>\n"
-            f"• الوقت: <b>{created}</b>\n\n{content}"
-        )
-        await callback.answer()
-        return
+        if user_id != ADMIN_ID:
+            if isinstance(message_or_callback, Message):
+                await message_or_callback.reply("هذا البوت خاص بالإدارة فقط")
+            elif isinstance(message_or_callback, CallbackQuery):
+                await message_or_callback.answer("غير مصرح لك", show_alert=True)
+            return
+        return await func(message_or_callback, *args, **kwargs)
+    return wrapper
 
-    if action == "reset":
-        save_settings(
-            db,
-            posting_enabled="1",
-            reminders_enabled="1",
-            post_mode="alternate",
-            post_interval_min="60",
-            reminder_interval_min="30",
-            alternate_next="english",
-            next_post_at=str(now_ts() + 60 * 60),
-            next_reminder_at=str(now_ts() + 30 * 60),
-        )
-        await update_panel("♻ تمت إعادة الضبط إلى الإعدادات الافتراضية")
-        return
-
-    await callback.answer("أمر غير معروف", show_alert=True)
-
-
-@router.message(InputStates.waiting_post_interval)
-async def input_post_interval(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
-        await admin_only_reply(message)
-        return
-    text = (message.text or "").strip()
-    if not text.isdigit():
-        await message.answer("أرسل رقمًا صحيحًا بالدقائق فقط.")
-        return
-    minutes = validate_positive_minutes(int(text))
-    save_settings(DB_INSTANCE, post_interval_min=str(minutes), next_post_at=str(now_ts() + minutes * 60))
-    await state.clear()
-    await message.answer(f"✅ تم ضبط مدة النشر إلى {minutes} دقيقة", reply_markup=panel_keyboard())
-
-
-@router.message(InputStates.waiting_reminder_interval)
-async def input_reminder_interval(message: Message, state: FSMContext) -> None:
-    if not is_admin(message.from_user.id):
-        await admin_only_reply(message)
-        return
-    text = (message.text or "").strip()
-    if not text.isdigit():
-        await message.answer("أرسل رقمًا صحيحًا بالدقائق فقط.")
-        return
-    minutes = validate_positive_minutes(int(text))
-    save_settings(DB_INSTANCE, reminder_interval_min=str(minutes), next_reminder_at=str(now_ts() + minutes * 60))
-    await state.clear()
-    await message.answer(f"✅ تم ضبط مدة التذكير إلى {minutes} دقيقة", reply_markup=panel_keyboard())
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-async def on_startup(bot: Bot) -> None:
-    logging.info("Starting bot...")
-    APP_INSTANCE.start_background_tasks()
-
-
-async def on_shutdown(bot: Bot) -> None:
-    logging.info("Shutting down...")
-    await APP_INSTANCE.stop_background_tasks()
-    DB_INSTANCE.close()
-    await bot.session.close()
-
-
-async def main() -> None:
-    global CONFIG, DB_INSTANCE, APP_INSTANCE
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
+@admin_only
+async def cmd_start(message: Message, bot: Bot, settings_mgr: SettingsManager):
+    settings = settings_mgr.get()
+    await message.reply(
+        "مرحباً أيها الأدمن! لوحة التحكم الرئيسية:",
+        reply_markup=main_menu(settings)
     )
 
-    CONFIG = Config.from_env()
-    DB_INSTANCE = DB(CONFIG.db_path)
-    sync_timers(DB_INSTANCE)
+@admin_only
+async def handle_callback(callback: CallbackQuery, bot: Bot, settings_mgr: SettingsManager, ai_gen: AIGenerator, scheduler: Scheduler):
+    data = callback.data
+    settings = settings_mgr.get()
+    await callback.answer()  # acknowledge
 
-    bot = Bot(
-        token=CONFIG.bot_token,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
+    if data == "toggle_posting":
+        new_state = not settings.posting_enabled
+        await settings_mgr.update(posting_enabled=new_state)
+        if new_state:
+            await scheduler.start_posting_task()
+        else:
+            await scheduler.stop_posting_task()
+        await callback.message.edit_text(
+            f"تم {'تفعيل' if new_state else 'إيقاف'} النشر التلقائي.",
+            reply_markup=main_menu(settings_mgr.get())
+        )
 
-    ai = AIEngine(CONFIG.openai_api_key, CONFIG.ai_model)
-    APP_INSTANCE = AutoPublisher(bot=bot, db=DB_INSTANCE, ai=ai)
+    elif data == "change_mode":
+        await callback.message.edit_text("اختر نمط النشر:", reply_markup=mode_selection_menu())
 
+    elif data.startswith("mode_"):
+        mode = data.split("_")[1]
+        if mode == "arabic_only":
+            await settings_mgr.update(post_mode="arabic_only")
+        elif mode == "english_only":
+            await settings_mgr.update(post_mode="english_only")
+        elif mode == "alternating":
+            await settings_mgr.update(post_mode="alternating")
+        await callback.message.edit_text(f"تم ضبط نمط النشر على {mode}.", reply_markup=main_menu(settings_mgr.get()))
+
+    elif data == "set_post_interval":
+        await callback.message.edit_text("اختر مدة النشر (بالدقائق):", reply_markup=interval_menu("post_interval"))
+
+    elif data == "set_reminder_interval":
+        await callback.message.edit_text("اختر مدة التذكير (بالدقائق):", reply_markup=interval_menu("reminder_interval"))
+
+    elif data.startswith("post_interval_"):
+        minutes = int(data.split("_")[2])
+        await settings_mgr.update(post_interval_minutes=minutes)
+        await scheduler.restart_all()  # restart tasks to apply new interval
+        await callback.message.edit_text(f"تم ضبط مدة النشر إلى {minutes} دقيقة.", reply_markup=main_menu(settings_mgr.get()))
+
+    elif data.startswith("reminder_interval_"):
+        minutes = int(data.split("_")[2])
+        await settings_mgr.update(reminder_interval_minutes=minutes)
+        await scheduler.restart_all()
+        await callback.message.edit_text(f"تم ضبط مدة التذكير إلى {minutes} دقيقة.", reply_markup=main_menu(settings_mgr.get()))
+
+    elif data == "toggle_reminders":
+        new_state = not settings.reminders_enabled
+        await settings_mgr.update(reminders_enabled=new_state)
+        if new_state:
+            await scheduler.start_reminder_task()
+        else:
+            await scheduler.stop_reminder_task()
+        await callback.message.edit_text(
+            f"تم {'تفعيل' if new_state else 'إيقاف'} التذكيرات.",
+            reply_markup=main_menu(settings_mgr.get())
+        )
+
+    elif data == "generate_now":
+        # Generate based on current mode, but allow preview
+        # For simplicity, we generate one random (but honor mode?)
+        if settings.post_mode == "arabic_only":
+            content = await ai_gen.generate_arabic_poetry(settings.formatting_style_arabic)
+            formatted = TextFormatter.format_arabic(content, settings.formatting_style_arabic)
+        elif settings.post_mode == "english_only":
+            content = await ai_gen.generate_english_quote(settings.formatting_style_english)
+            formatted = TextFormatter.format_english(content, settings.formatting_style_english)
+        else:
+            # alternating - choose opposite of last, but for manual we can just pick random
+            lang = random.choice(["arabic", "english"])
+            if lang == "arabic":
+                content = await ai_gen.generate_arabic_poetry(settings.formatting_style_arabic)
+                formatted = TextFormatter.format_arabic(content, settings.formatting_style_arabic)
+            else:
+                content = await ai_gen.generate_english_quote(settings.formatting_style_english)
+                formatted = TextFormatter.format_english(content, settings.formatting_style_english)
+        await settings_mgr.update(last_generated_content=formatted)
+        await callback.message.edit_text(
+            f"تم توليد النص:\n\n{formatted}\n\nهل تريد نشره الآن؟",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="نشر الآن", callback_data="publish_generated")],
+                [InlineKeyboardButton(text="إلغاء", callback_data="back_to_main")]
+            ])
+        )
+
+    elif data == "publish_generated":
+        last_gen = settings.last_generated_content
+        if last_gen:
+            try:
+                await bot.send_message(chat_id=CHANNEL_ID, text=last_gen, parse_mode="HTML")
+                await callback.message.edit_text("تم نشر المحتوى في القناة.", reply_markup=main_menu(settings_mgr.get()))
+            except Exception as e:
+                await callback.message.edit_text(f"فشل النشر: {e}", reply_markup=main_menu(settings_mgr.get()))
+        else:
+            await callback.message.edit_text("لا يوجد محتوى مولد مسبقاً.", reply_markup=main_menu(settings_mgr.get()))
+
+    elif data == "preview":
+        # Generate preview without sending to channel
+        if settings.post_mode == "arabic_only":
+            content = await ai_gen.generate_arabic_poetry(settings.formatting_style_arabic)
+            formatted = TextFormatter.format_arabic(content, settings.formatting_style_arabic)
+        elif settings.post_mode == "english_only":
+            content = await ai_gen.generate_english_quote(settings.formatting_style_english)
+            formatted = TextFormatter.format_english(content, settings.formatting_style_english)
+        else:
+            lang = random.choice(["arabic", "english"])
+            if lang == "arabic":
+                content = await ai_gen.generate_arabic_poetry(settings.formatting_style_arabic)
+                formatted = TextFormatter.format_arabic(content, settings.formatting_style_arabic)
+            else:
+                content = await ai_gen.generate_english_quote(settings.formatting_style_english)
+                formatted = TextFormatter.format_english(content, settings.formatting_style_english)
+        await settings_mgr.update(last_generated_content=formatted)
+        await callback.message.edit_text(
+            f"معاينة النص:\n\n{formatted}\n\nهل تريد نشره؟",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="نشر الآن", callback_data="publish_generated")],
+                [InlineKeyboardButton(text="إلغاء", callback_data="back_to_main")]
+            ])
+        )
+
+    elif data == "last_post":
+        last = settings.last_post_content or "لا يوجد منشورات سابقة."
+        await callback.message.edit_text(f"آخر منشور:\n{last}", reply_markup=main_menu(settings_mgr.get()))
+
+    elif data == "show_settings":
+        text = f"""الإعدادات الحالية:
+- النشر التلقائي: {'مفعل' if settings.posting_enabled else 'معطل'}
+- نمط النشر: {settings.post_mode}
+- مدة النشر: {settings.post_interval_minutes} دقيقة
+- التذكيرات: {'مفعلة' if settings.reminders_enabled else 'معطلة'}
+- مدة التذكير: {settings.reminder_interval_minutes} دقيقة
+- آخر لغة: {settings.last_language}
+"""
+        await callback.message.edit_text(text, reply_markup=main_menu(settings_mgr.get()))
+
+    elif data == "reset_settings":
+        new_settings = BotSettings()
+        await settings_mgr.update(**new_settings.to_dict())
+        await scheduler.restart_all()
+        await callback.message.edit_text("تم إعادة تعيين جميع الإعدادات.", reply_markup=main_menu(settings_mgr.get()))
+
+    elif data == "system_status":
+        text = f"حالة النظام:\n- البوت يعمل\n- النشر: {'نشط' if settings.posting_enabled else 'متوقف'}\n- التذكيرات: {'نشطة' if settings.reminders_enabled else 'متوقفة'}\n- إصدار الإعدادات: {settings.version}"
+        await callback.message.edit_text(text, reply_markup=main_menu(settings_mgr.get()))
+
+    elif data == "change_english_style":
+        await callback.message.edit_text("اختر نمط التنسيق للإنجليزية:", reply_markup=style_menu("english"))
+
+    elif data == "change_arabic_style":
+        await callback.message.edit_text("اختر نمط التنسيق للعربية:", reply_markup=style_menu("arabic"))
+
+    elif data.startswith("style_eng_"):
+        style_idx = int(data.split("_")[2])
+        await settings_mgr.update(formatting_style_english=style_idx)
+        await callback.message.edit_text("تم تغيير نمط التنسيق للإنجليزية.", reply_markup=main_menu(settings_mgr.get()))
+
+    elif data.startswith("style_arb_"):
+        style_idx = int(data.split("_")[2])
+        await settings_mgr.update(formatting_style_arabic=style_idx)
+        await callback.message.edit_text("تم تغيير نمط التنسيق للعربية.", reply_markup=main_menu(settings_mgr.get()))
+
+    elif data == "emergency_stop":
+        await settings_mgr.update(posting_enabled=False, reminders_enabled=False)
+        await scheduler.stop_posting_task()
+        await scheduler.stop_reminder_task()
+        await callback.message.edit_text("تم إيقاف جميع المهام فورياً.", reply_markup=main_menu(settings_mgr.get()))
+
+    elif data == "auto_start":
+        await settings_mgr.update(posting_enabled=True, reminders_enabled=DEFAULT_REMINDERS_ENABLED)
+        await scheduler.start_posting_task()
+        await scheduler.start_reminder_task()
+        await callback.message.edit_text("تم تشغيل النشر والتذكيرات تلقائياً.", reply_markup=main_menu(settings_mgr.get()))
+
+    elif data == "reload_settings":
+        await settings_mgr.reload()
+        await scheduler.restart_all()
+        await callback.message.edit_text("تم إعادة تحميل الإعدادات من الملف.", reply_markup=main_menu(settings_mgr.get()))
+
+    elif data == "back_to_main":
+        await callback.message.edit_text("لوحة التحكم الرئيسية:", reply_markup=main_menu(settings_mgr.get()))
+
+    else:
+        await callback.message.edit_text("خيار غير معروف.", reply_markup=main_menu(settings_mgr.get()))
+
+# =========================
+#  MAIN ENTRYPOINT
+# =========================
+async def main():
+    # Validate configurations
+    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE" or ADMIN_ID == 123456789 or CHANNEL_ID == -1001234567890 or OPENAI_API_KEY == "YOUR_OPENAI_API_KEY_HERE":
+        logger.critical("Please set your BOT_TOKEN, ADMIN_ID, CHANNEL_ID, and OPENAI_API_KEY in the script.")
+        sys.exit(1)
+
+    # Initialize bot and dispatcher
+    bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
 
-    await dp.start_polling(
-        bot,
-        allowed_updates=dp.resolve_used_update_types(),
-        on_startup=on_startup,
-        on_shutdown=on_shutdown,
-    )
+    # Initialize managers and AI
+    settings_mgr = SettingsManager(SETTINGS_FILE)
+    ai_gen = AIGenerator(OPENAI_API_KEY)
+    scheduler = Scheduler(bot, settings_mgr, ai_gen)
 
+    # Register handlers
+    dp.message.register(cmd_start, CommandStart())
+    dp.callback_query.register(lambda c: handle_callback(c, bot, settings_mgr, ai_gen, scheduler))
+
+    # Start scheduler tasks based on current settings
+    settings = settings_mgr.get()
+    if settings.posting_enabled:
+        await scheduler.start_posting_task()
+    if settings.reminders_enabled:
+        await scheduler.start_reminder_task()
+
+    # Graceful shutdown
+    async def shutdown():
+        logger.info("Shutting down...")
+        await scheduler.stop_posting_task()
+        await scheduler.stop_reminder_task()
+        await bot.session.close()
+
+    dp.shutdown.register(shutdown)
+
+    # Start polling
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        await shutdown()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(main())
