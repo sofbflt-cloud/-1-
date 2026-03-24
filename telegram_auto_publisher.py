@@ -21,8 +21,34 @@ Environment variables (set before running):
   OPENAI_API_KEY  – optional, OpenAI API key
   AI_MODEL        – optional, default "gpt-4o-mini"
   TIMEZONE        – optional, default "UTC"
-  DB_PATH         – optional, default "bot_state.sqlite3"
+  DB_PATH         – optional, default "bot_state.sqlite3
 """
+
+import sys
+import subprocess
+import pkg_resources
+
+# قائمة المكتبات المطلوبة
+required = {
+    "aiogram",
+    "openai",
+    "aiohttp",
+    "python-dotenv"
+}
+
+# جلب المكتبات المثبتة
+installed = {pkg.key for pkg in pkg_resources.working_set}
+
+# تحديد الناقص
+missing = required - installed
+
+if missing:
+    print(f"📦 جاري تثبيت المكتبات الناقصة: {missing}")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+else:
+    print("✅ كل المكتبات مثبتة مسبقًا")
+
+# بعد التثبيت نقدر نستورد عادي
 
 from __future__ import annotations
 
